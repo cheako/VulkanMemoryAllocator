@@ -1880,6 +1880,7 @@ available through VmaAllocatorCreateInfo::pRecordSettings.
 #endif
 
 #ifndef VULKAN_H_
+    #define VK_ENABLE_BETA_EXTENSIONS
     #include <vulkan/vulkan.h>
 #endif
 
@@ -3696,6 +3697,29 @@ VMA_CALL_PRE void VMA_CALL_POST vmaDestroyAccelerationStructure(
     VmaAllocator allocator,
     VMA_DECORATE_RAY_TRACING(VkAccelerationStructure) accelerationStructrure,
     VmaAllocation allocation);
+
+/** \brief Creates a buffer suitable for build or update of ray tracing acceleration structure.
+
+The function is similar to vmaCreateBuffer(), but it automatically calculates
+required size based on given acceleration structure parameters.
+`type` must be `VK_ACCELERATION_STRUCTURE_MEMORY_REQUIREMENTS_TYPE_BUILD_SCRATCH_KHR`
+or `VK_ACCELERATION_STRUCTURE_MEMORY_REQUIREMENTS_TYPE_UPDATE_SCRATCH_KHR`.
+
+`pBufferCreateInfo->size` can be zero. If its value not zero, the size of the
+created buffer is maximum of this value and the required size calculated based
+on the acceleration structure.
+
+You can free the buffer normally when no longer needed e.g. using vmaDestroyBuffer().
+*/
+VMA_CALL_PRE VkResult VMA_CALL_POST vmaCreateAccelerationStructureScratchBuffer(
+    VmaAllocator allocator,
+    VMA_DECORATE_RAY_TRACING(VkAccelerationStructureMemoryRequirementsType) type,
+    VMA_DECORATE_RAY_TRACING(VkAccelerationStructure) accelerationStructure,
+    const VkBufferCreateInfo* pBufferCreateInfo,
+    const VmaAllocationCreateInfo* pAllocationCreateInfo,
+    VkBuffer* pBuffer,
+    VmaAllocation* pAllocation,
+    VmaAllocationInfo* pAllocationInfo);
 
 #ifdef __cplusplus
 }
@@ -7455,7 +7479,7 @@ public:
     void GetAccelerationStructureMemoryRequirements(
         VMA_DECORATE_RAY_TRACING(VkAccelerationStructureMemoryRequirementsType) type,
         VMA_DECORATE_RAY_TRACING(VkAccelerationStructure) hAccelerationStructure,
-        VkMemoryRequirements& memReq) const;
+        VkMemoryRequirements& outMemReq) const;
 
     // Main allocation function.
     VkResult AllocateMemory(
@@ -15438,7 +15462,7 @@ void VmaAllocator_T::ImportVulkanFunctions(const VmaVulkanFunctions* pVulkanFunc
     m_VulkanFunctions.VMA_DECORATE_RAY_TRACING(vkDestroyAccelerationStructure) =
         (PFN_vkDestroyAccelerationStructureNV)vkGetDeviceProcAddr(m_hDevice, VMA_DECORATE_RAY_TRACING_STRING("vkDestroyAccelerationStructure"));
     m_VulkanFunctions.VMA_DECORATE_RAY_TRACING(vkGetAccelerationStructureMemoryRequirements) =
-        (PFN_vkGetAccelerationStructureMemoryRequirementsNV)vkGetDeviceProcAddr(m_hDevice, VMA_DECORATE_RAY_TRACING_STRING("vkGetAccelerationStructureMemoryRequirements"));
+        (VMA_DECORATE_RAY_TRACING(PFN_vkGetAccelerationStructureMemoryRequirements))vkGetDeviceProcAddr(m_hDevice, VMA_DECORATE_RAY_TRACING_STRING("vkGetAccelerationStructureMemoryRequirements"));
     m_VulkanFunctions.VMA_DECORATE_RAY_TRACING(vkBindAccelerationStructureMemory) =
         (PFN_vkBindAccelerationStructureMemoryNV)vkGetDeviceProcAddr(m_hDevice, VMA_DECORATE_RAY_TRACING_STRING("vkBindAccelerationStructureMemory"));
 #endif // #if VMA_STATIC_VULKAN_FUNCTIONS == 1
@@ -15906,17 +15930,18 @@ void VmaAllocator_T::GetImageMemoryRequirements(
 void VmaAllocator_T::GetAccelerationStructureMemoryRequirements(
     VMA_DECORATE_RAY_TRACING(VkAccelerationStructureMemoryRequirementsType) type,
     VMA_DECORATE_RAY_TRACING(VkAccelerationStructure) hAccelerationStructure,
-    VkMemoryRequirements& memReq) const
+    VkMemoryRequirements& outMemReq) const
 {
-    VMA_DECORATE_RAY_TRACING(VkAccelerationStructureMemoryRequirementsInfo) memReqInfo = { VMA_DECORATE_RAY_TRACING_CONSTANT(VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_MEMORY_REQUIREMENTS_INFO) };
-    memReqInfo.type = VMA_DECORATE_RAY_TRACING_CONSTANT(VK_ACCELERATION_STRUCTURE_MEMORY_REQUIREMENTS_TYPE_OBJECT);
+    VMA_DECORATE_RAY_TRACING(VkAccelerationStructureMemoryRequirementsInfo) memReqInfo = {
+        VMA_DECORATE_RAY_TRACING_CONSTANT(VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_MEMORY_REQUIREMENTS_INFO) };
+    memReqInfo.type = type;
     memReqInfo.accelerationStructure = hAccelerationStructure;
 
     VkMemoryRequirements2 memReq2 = { VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
 
     (*m_VulkanFunctions.VMA_DECORATE_RAY_TRACING(vkGetAccelerationStructureMemoryRequirements))(m_hDevice, &memReqInfo, &memReq2);
 
-    memReq = memReq2.memoryRequirements;
+    outMemReq = memReq2.memoryRequirements;
 }
 
 VkResult VmaAllocator_T::AllocateMemory(
@@ -18325,7 +18350,7 @@ VMA_CALL_PRE VkResult VMA_CALL_POST vmaBindImageMemory2(
         return allocator->BindImageMemory(allocation, allocationLocalOffset, image, pNext);
 }
 
-VMA_CALL_PRE VkResult VMA_CALL_POST vmaCreateBuffer(
+VkResult VmaCreateBufferInternal(
     VmaAllocator allocator,
     const VkBufferCreateInfo* pBufferCreateInfo,
     const VmaAllocationCreateInfo* pAllocationCreateInfo,
@@ -18333,22 +18358,12 @@ VMA_CALL_PRE VkResult VMA_CALL_POST vmaCreateBuffer(
     VmaAllocation* pAllocation,
     VmaAllocationInfo* pAllocationInfo)
 {
-    VMA_ASSERT(allocator && pBufferCreateInfo && pAllocationCreateInfo && pBuffer && pAllocation);
-
-    if(pBufferCreateInfo->size == 0)
-    {
-        return VK_ERROR_VALIDATION_FAILED_EXT;
-    }
     if((pBufferCreateInfo->usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_COPY) != 0 &&
         !allocator->m_UseKhrBufferDeviceAddress)
     {
         VMA_ASSERT(0 && "Creating a buffer with VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT is not valid if VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT was not used.");
         return VK_ERROR_VALIDATION_FAILED_EXT;
     }
-    
-    VMA_DEBUG_LOG("vmaCreateBuffer");
-    
-    VMA_DEBUG_GLOBAL_MUTEX_LOCK
 
     *pBuffer = VK_NULL_HANDLE;
     *pAllocation = VK_NULL_HANDLE;
@@ -18425,6 +18440,29 @@ VMA_CALL_PRE VkResult VMA_CALL_POST vmaCreateBuffer(
         return res;
     }
     return res;
+}
+
+VMA_CALL_PRE VkResult VMA_CALL_POST vmaCreateBuffer(
+    VmaAllocator allocator,
+    const VkBufferCreateInfo* pBufferCreateInfo,
+    const VmaAllocationCreateInfo* pAllocationCreateInfo,
+    VkBuffer* pBuffer,
+    VmaAllocation* pAllocation,
+    VmaAllocationInfo* pAllocationInfo)
+{
+    VMA_ASSERT(allocator && pBufferCreateInfo && pAllocationCreateInfo && pBuffer && pAllocation);
+
+    if(pBufferCreateInfo->size == 0)
+    {
+        return VK_ERROR_VALIDATION_FAILED_EXT;
+    }
+   
+    VMA_DEBUG_LOG("vmaCreateBuffer");
+    
+    VMA_DEBUG_GLOBAL_MUTEX_LOCK
+
+    return VmaCreateBufferInternal(allocator, pBufferCreateInfo,
+        pAllocationCreateInfo, pBuffer, pAllocation, pAllocationInfo);
 }
 
 VMA_CALL_PRE void VMA_CALL_POST vmaDestroyBuffer(
@@ -18723,6 +18761,34 @@ VMA_CALL_PRE void VMA_CALL_POST vmaDestroyAccelerationStructure(
             1, // allocationCount
             &allocation);
     }
+}
+
+VMA_CALL_PRE VkResult VMA_CALL_POST vmaCreateAccelerationStructureScratchBuffer(
+    VmaAllocator allocator,
+    VMA_DECORATE_RAY_TRACING(VkAccelerationStructureMemoryRequirementsType) type,
+    VMA_DECORATE_RAY_TRACING(VkAccelerationStructure) accelerationStructure,
+    const VkBufferCreateInfo* pBufferCreateInfo,
+    const VmaAllocationCreateInfo* pAllocationCreateInfo,
+    VkBuffer* pBuffer,
+    VmaAllocation* pAllocation,
+    VmaAllocationInfo* pAllocationInfo)
+{
+    VMA_ASSERT(allocator && accelerationStructure != VK_NULL_HANDLE && pBufferCreateInfo && pAllocationCreateInfo && pBuffer && pAllocation);
+    VMA_ASSERT(type == VMA_DECORATE_RAY_TRACING_CONSTANT(VK_ACCELERATION_STRUCTURE_MEMORY_REQUIREMENTS_TYPE_BUILD_SCRATCH) ||
+        type == VMA_DECORATE_RAY_TRACING_CONSTANT(VK_ACCELERATION_STRUCTURE_MEMORY_REQUIREMENTS_TYPE_UPDATE_SCRATCH));
+
+    VMA_DEBUG_LOG("vmaCreateAccelerationStructureScratchBuffer");
+
+    VMA_DEBUG_GLOBAL_MUTEX_LOCK
+
+    VkMemoryRequirements memReq = {};
+    allocator->GetAccelerationStructureMemoryRequirements(type, accelerationStructure, memReq);
+
+    VkBufferCreateInfo bufCreateInfoCopy = *pBufferCreateInfo;
+    bufCreateInfoCopy.size = VMA_MAX(bufCreateInfoCopy.size, memReq.size);
+
+    return VmaCreateBufferInternal(allocator, &bufCreateInfoCopy,
+        pAllocationCreateInfo, pBuffer, pAllocation, pAllocationInfo);
 }
 
 #endif // #ifdef VMA_IMPLEMENTATION
